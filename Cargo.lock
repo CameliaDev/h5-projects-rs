@@ -293,7 +293,6 @@ dependencies = [
  "panic-probe",
  "rust-mqtt",
  "sht3x-ner",
- "static_cell",
  "variant_count",
 ]
 
@@ -1613,7 +1612,6 @@ checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 [[package]]
 name = "sht3x-ner"
 version = "0.1.0"
-source = "git+https://github.com/Northeastern-Electric-Racing/firmware-rs.git#7fa0fcb732efb6b183f525cb8500c2107c57effa"
 dependencies = [
  "defmt 1.1.1",
  "embedded-hal-async",

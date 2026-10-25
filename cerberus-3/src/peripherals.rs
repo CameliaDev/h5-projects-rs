@@ -1,116 +1,156 @@
-//! cerberus-3 SHT30 peripherals — issue #48
+//! SHT30 temperature and humidity.
 //!
-//! Uses `sht3x-ner` for single-shot measure + CRC.
-//! Heater on/off uses datasheet 16-bit commands (crate has no public heater API).
+//! One `Sht3x` is created in `sht30_init` and kept in the static mutex. Later
+//! calls reuse that driver. The latest sample is copied into the same mutex
+//! (`*SHT30.lock().await = Some(sensor)`), matching the state-machine mutex.
+//!
+//! Board I2C pins are not fixed yet, so `main` does not call this.
 
-// Module is not wired into main.rs yet; remove this once Sht30_init is called from main.
+// Nothing spawns the task until the I2C pins are known.
 #![allow(dead_code)]
 
-use embassy_sync::blocking_mutex::raw::CriticalSectionRawMutex;
+use defmt::{Debug2Format, error, info};
+use embassy_stm32::Peri;
+use embassy_stm32::i2c::{
+    self, Config, ErrorInterruptHandler, EventInterruptHandler, I2c, Instance, SclPin, SdaPin,
+};
+use embassy_stm32::interrupt::typelevel::Binding;
+use embassy_stm32::mode::Async;
+use embassy_sync::blocking_mutex::raw::ThreadModeRawMutex;
 use embassy_sync::mutex::Mutex;
 use embassy_time::{Delay, Timer};
-use sht3x_ner::{Address, ClockStretch, Error, Repeatability, Sht3x};
-use static_cell::StaticCell;
+use sht3x_ner::{Address, ClockStretch, Commands, Error as ShtError, Repeatability, Sht3x};
 
-/// Temperature (°C), humidity (%RH), and I2C address.
+/// Latest temperature (°C) and relative humidity (%RH).
+#[derive(Clone, Copy, Debug)]
 pub struct Sht30Data {
     pub temperature: f32,
     pub humidity: f32,
-    pub address: Address,
 }
 
-/// Owns the I2C bus + cached reading. Wrapped in a shared Mutex for multi-task use.
-pub struct Sht30Sensor<I2C> {
-    i2c: I2C,
+impl Sht30Data {
+    const INIT: Self = Self {
+        temperature: 0.0,
+        humidity: 0.0,
+    };
+}
+
+type I2cBus = I2c<'static, Async, i2c::Master>;
+
+/// Driver plus the last sample copied out for other tasks.
+struct Sht30Sensor {
+    drv: Sht3x<I2cBus>,
     data: Sht30Data,
 }
 
-const HEATER_ENABLE: u16 = 0x306D;
-const HEATER_DISABLE: u16 = 0x3066;
-const COMMAND_WAIT_MS: u64 = 1;
+/// Shared sensor. `None` until `sht30_init` publishes one.
+static SHT30: Mutex<ThreadModeRawMutex, Option<Sht30Sensor>> = Mutex::new(None);
 
-// The I2C instance (I2C1..I2C4) is chosen by the caller in main.rs; this module is not tied to a specific instance.
-type I2cBus =
-    embassy_stm32::i2c::I2c<'static, embassy_stm32::mode::Async, embassy_stm32::i2c::Master>;
-type Shared = Mutex<CriticalSectionRawMutex, Sht30Sensor<I2cBus>>;
-type Sht3xError = Error<embassy_stm32::i2c::Error>;
-
-static SHT30: StaticCell<Shared> = StaticCell::new();
-
-/// Sht30_init — initialize over I2C at `address`, store behind shared Mutex.
-/// Returns a `'static` handle for the caller to pass into the `tempsensor_*` functions.
-#[allow(non_snake_case)] // issue #48 specifies this name
-pub async fn Sht30_init(i2c: I2cBus, address: Address) -> &'static Shared {
-    let mut sensor = Sht30Sensor {
-        i2c,
-        data: Sht30Data {
-            temperature: 0.0,
-            humidity: 0.0,
-            address,
-        },
-    };
-    // Soft reset via driver
-    {
-        let mut delay = Delay;
-        let mut drv = Sht3x::new(&mut sensor.i2c, address);
-        if drv.reset(&mut delay).await.is_err() {
-            defmt::error!("SHT30 reset failed");
-        }
-    }
-    SHT30.init(Mutex::new(sensor))
+/// Peripherals the SHT30 is wired to.
+///
+/// The I2C instance and pins come from the caller, same way `CanPins` and
+/// `EfusePins` hand `Peri`s into the module that constructs the driver.
+pub struct Sht30Pins<T, SCL, SDA>
+where
+    T: Instance,
+    SCL: SclPin<T>,
+    SDA: SdaPin<T>,
+{
+    pub i2c: Peri<'static, T>,
+    pub scl: Peri<'static, SCL>,
+    pub sda: Peri<'static, SDA>,
 }
 
-/// tempsensor_toggleHeater(enable)
-#[allow(non_snake_case)] // issue #48 specifies this name
-pub async fn tempsensor_toggleHeater(
-    shared: &'static Shared,
-    enable: bool,
-) -> Result<(), Sht3xError> {
-    let mut g = shared.lock().await;
-    let addr = g.data.address as u8;
-    let cmd = if enable {
-        HEATER_ENABLE
-    } else {
-        HEATER_DISABLE
+#[derive(Debug)]
+pub enum Sht30Error {
+    /// `sht30_init` has not stored a sensor yet.
+    NotInitialized,
+    Sensor(ShtError<i2c::Error>),
+}
+
+impl From<ShtError<i2c::Error>> for Sht30Error {
+    fn from(value: ShtError<i2c::Error>) -> Self {
+        Self::Sensor(value)
+    }
+}
+
+/// Soft-reset the sensor and store it in the shared mutex.
+///
+/// Uses interrupt-driven I2C without DMA. A measurement is only a few bytes.
+pub async fn sht30_init<T, SCL, SDA, IRQ>(
+    pins: Sht30Pins<T, SCL, SDA>,
+    irq: IRQ,
+    address: Address,
+) -> Result<(), Sht30Error>
+where
+    T: Instance,
+    SCL: SclPin<T>,
+    SDA: SdaPin<T>,
+    IRQ: Binding<T::EventInterrupt, EventInterruptHandler<T>>
+        + Binding<T::ErrorInterrupt, ErrorInterruptHandler<T>>
+        + 'static,
+{
+    let mut sensor = Sht30Sensor {
+        drv: Sht3x::new(
+            I2c::new_no_dma(pins.i2c, pins.scl, pins.sda, irq, Config::default()),
+            address,
+        ),
+        data: Sht30Data::INIT,
     };
-    g.i2c
-        .write(addr, &cmd.to_be_bytes())
-        .await
-        .map_err(Error::I2c)?;
-    Timer::after_millis(COMMAND_WAIT_MS).await;
+
+    let mut delay = Delay;
+    sensor.drv.reset(&mut delay).await?;
+    *SHT30.lock().await = Some(sensor);
     Ok(())
 }
 
-/// tempsensor_getTemperatureAndHumidity() -> (f32, f32)
-#[allow(non_snake_case)] // issue #48 specifies this name
-pub async fn tempsensor_getTemperatureAndHumidity(
-    shared: &'static Shared,
-) -> Result<(f32, f32), Sht3xError> {
-    let mut g = shared.lock().await;
-    let address = g.data.address;
+/// Turn the heater on or off through `Sht3x::send_command`.
+pub async fn sht30_toggle_heater(enable: bool) -> Result<(), Sht30Error> {
+    let mut guard = SHT30.lock().await;
+    let sensor = guard.as_mut().ok_or(Sht30Error::NotInitialized)?;
     let mut delay = Delay;
-    // Temporarily wrap bus for the driver call
-    let mut drv = Sht3x::new(&mut g.i2c, address);
-    let m = drv
-        .measure(ClockStretch::Disabled, Repeatability::High, &mut delay)
-        .await?;
-    // sht3x-ner: temp in 0.01°C, humidity in 0.01%RH
-    let t = m.temperature as f32 / 100.0;
-    let h = m.humidity as f32 / 100.0;
-    g.data.temperature = t;
-    g.data.humidity = h;
-    Ok((t, h))
+    let command = if enable {
+        Commands::HeaterEnable
+    } else {
+        Commands::HeaterDisable
+    };
+    sensor.drv.send_command(command, &mut delay).await?;
+    Ok(())
 }
 
-/// Example task — spawn from main.rs:
-/// `let sht30 = peripherals::Sht30_init(i2c, addr).await;`
-/// `spawner.spawn(peripherals::tempsensor_task(sht30))`
+/// Single-shot high-repeatability measurement, copied back into the mutex.
+pub async fn sht30_temperature_and_humidity() -> Result<(f32, f32), Sht30Error> {
+    let mut guard = SHT30.lock().await;
+    let sensor = guard.as_mut().ok_or(Sht30Error::NotInitialized)?;
+    let mut delay = Delay;
+    let measurement = sensor
+        .drv
+        .measure(ClockStretch::Disabled, Repeatability::High, &mut delay)
+        .await?;
+
+    // sht3x-ner reports temperature and humidity in hundredths.
+    let data = Sht30Data {
+        temperature: measurement.temperature as f32 / 100.0_f32,
+        humidity: measurement.humidity as f32 / 100.0_f32,
+    };
+    sensor.data = data;
+    Ok((data.temperature, data.humidity))
+}
+
+/// Copy of the latest sample. Does not start a measurement.
+pub async fn sht30_reading() -> Option<Sht30Data> {
+    SHT30.lock().await.as_ref().map(|sensor| sensor.data)
+}
+
+/// Log a sample once a second. Spawn after `sht30_init`.
 #[embassy_executor::task]
-pub async fn tempsensor_task(shared: &'static Shared) {
+pub async fn sht30_task() {
     loop {
-        match tempsensor_getTemperatureAndHumidity(shared).await {
-            Ok((t, h)) => defmt::info!("SHT30: {} C, {} %RH", t, h),
-            Err(e) => defmt::error!("SHT30 read failed: {:?}", defmt::Debug2Format(&e)),
+        match sht30_temperature_and_humidity().await {
+            Ok((temperature, humidity)) => {
+                info!("SHT30: {} C, {} %RH", temperature, humidity);
+            }
+            Err(err) => error!("SHT30 read failed: {:?}", Debug2Format(&err)),
         }
         Timer::after_millis(1000).await;
     }

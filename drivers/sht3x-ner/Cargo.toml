@@ -1,0 +1,12 @@
+[package]
+name = "sht3x-ner"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+defmt.workspace = true
+embedded-hal-async.workspace = true
+
+[lints]
+workspace = true
