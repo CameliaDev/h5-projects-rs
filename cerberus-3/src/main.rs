@@ -19,7 +19,9 @@ mod adc;
 mod buttons;
 mod can;
 mod efuses;
+mod i2c;
 mod rtds;
+mod sht30;
 mod statemachine;
 
 use crate::can::can_inbox_task;
